@@ -1,0 +1,351 @@
+总体框架：
+	atn.py
+		该文件用于根据FLAGS的参数，train或者test ATN模型
+		FLAGS = tf.flags.FLAGS
+		tf.flags.DEFINE_boolean('train', False, 'Train and save the ATN model.')
+		
+		包括main, test, train三个函数
+		
+		main:根据传入的参数，train或test模型
+			def main(arvg=None):
+				"""
+				"""
+				if FLAGS.train:
+					train()
+				else:
+					test()
+		
+		test:
+			def test():
+				"""
+				"""
+				print ("ok\n")
+				batch_size = mnist.test.num_examples   #batch等于mnist测试集的样本数
+				batch_xs, batch_ys = mnist.test.next_batch(batch_size)  #将数据传入
+				model = atn.ATN(images_holder, label_holder, p_keep_holder, rerank_holder)  #import atn_model as atn
+				
+				with tf.Session() as sess:
+					sess.run(tf.global_variables_initializer())  #调用sess的run()方法执行tf.global_variables_initializer()，初始化模型参数
+					model.load(sess, './Models/AE_for_ATN')
+					
+					
+					
+					adv_images = sess.run(     #生成的对抗样本
+						model.prediction,
+						#feed_dict={images_holder: mnist.test.images}
+						feed_dict={images_holder: batch_xs}
+					)
+					
+					print('Original accuracy: {0:0.5f}'.format(     #print原本的accuracy
+						sess.run(model._target.accuracy, feed_dict={   #feed_dict的作用是给使用placeholder创建出来的tensor赋值,可以提供 feed 数据作为 run() 调用的参数. feed 只在调用它的方法内有效
+							#images_holder: mnist.test.images,
+							#label_holder: mnist.test.labels,
+							images_holder: batch_xs,
+							label_holder: batch_ys,
+							p_keep_holder: 1.0
+						})))
+
+					print('Attacked accuracy: {0:0.5f}'.format(     #print攻击后的accuracy
+						sess.run(model._target.accuracy, feed_dict={
+							images_holder: adv_images,
+							#label_holder: mnist.test.labels,
+							label_holder: batch_ys,
+							p_keep_holder: 1.0
+						})))
+						
+					"""confidence_origin = sess.run(model._target.showY, feed_dict={
+											images_holder: batch_xs,
+											#label_holder: mnist.test.labels,
+											label_holder: batch_ys,
+											p_keep_holder: 1.0
+										})
+										
+					confidence_adv = sess.run(model._target.showY, feed_dict={
+											images_holder: adv_images,
+											#label_holder: mnist.test.labels,
+											label_holder: batch_ys,
+											p_keep_holder: 1.0
+										})"""
+
+					# Show some results.
+					f, a = plt.subplots(2, 50, figsize=(50, 2)) #matplotlib.subplots将画图面板分割，将多个子图同时显示，前面两个参数是分割的行和列（2行50列），figsize用来设置窗口大小
+					for i in range(50):
+						a[0][i].imshow(np.reshape(batch_xs[i], (28, 28)), cmap='gray') #第一行绘制batch_xs图（原图像，50个），cmap='gray'表示颜色空间为灰度图
+						a[0][i].axis('off') #关掉axis
+						a[1][i].axis('off')
+						a[1][i].imshow(np.reshape(adv_images[i], (28, 28)), cmap='gray')  #第二行绘制adv_images图 （生成的对抗样本）
+					plt.show()  #显示图像
+					plt.savefig('./Result/image.jpg')  #保存图像
+	
+		train:
+			def train():
+				"""
+				"""
+				attack_target = 8
+				alpha = 1.5
+				training_epochs = 10
+				batch_size = 64
+
+				model = atn.ATN(images_holder, label_holder, p_keep_holder, rerank_holder)
+
+				with tf.Session() as sess:
+					sess.run(tf.global_variables_initializer())
+					model._target.load(sess, './Models/AE_for_ATN/BasicCNN') #从basic_cnn中的load加载被攻击的目标模型
+
+					total_batch = int(mnist.train.num_examples/batch_size)  #total_batch为训练集batch的数量
+					#for epoch in range(training_epochs):
+					for epoch in range(10):
+						#for i in range(total_batch):
+						for i in range(total_batch):
+							print epoch, training_epochs, i, total_batch 
+							batch_xs, batch_ys = mnist.train.next_batch(batch_size)
+
+							r_res = sess.run(model._target.prediction,
+											 feed_dict={
+												 images_holder: batch_xs,
+												 p_keep_holder: 1.0
+											 })
+							r_res[:, attack_target] = np.max(r_res, axis=1) * alpha  #axis=1,按横向，得到alpha * max(y)
+							norm_div = np.linalg.norm(r_res, axis=1)  #L2范数
+							for i in range(len(r_res)):   #归一化，重整为一个概率分布
+								r_res[i] /= norm_div[i]
+
+							_, loss = sess.run(model.optimization, feed_dict={
+								images_holder: batch_xs,
+								p_keep_holder: 1.0,
+								rerank_holder: r_res
+							})
+
+						print('Eopch {0} completed. loss = {1}'.format(epoch+1, loss))
+					print("Optimization Finished!")
+
+					model.save(sess, './Models/AE_for_ATN')
+					print("Trained params have been saved to './Models/AE_for_ATN'")
+					
+		if __name__ == '__main__':
+			os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'   #os.environ['环境变量名称']='环境变量值'，设置系统环境变量，该设置表示只显示warning和Error
+			tf.app.run()
+
+					
+    atn_model.py
+		该文件定义一个Class ATN，该类中定义了ATN的框架
+		用data, label_gt, p_keep， rerank初始化，
+		
+		def __init__(self, data, label_gt, p_keep, rerank):
+			with tf.variable_scope('autoencoder'):
+				self._autoencoder = bae.BasicAE(data)
+			with tf.variable_scope('target') as scope:
+				self._target_adv = bcnn.BasicCnn(    #f(g(x)),BasicCnn定义了被攻击的网络，BasicAE定义ATN
+					self._autoencoder.prediction, label_gt, p_keep
+				)
+				scope.reuse_variables()
+				self._target = bcnn.BasicCnn(data, label_gt, p_keep) #f(x)
+			self.data = data
+			self.rerank = rerank
+		定义了optimization, prediction, load, save方法
+		
+		optimization:返回 optimizer（优化更新后的可训练参数列表）, loss
+			def optimization(self):
+				loss_beta = 0.1
+				learning_rate = 0.01
+
+				y_pred = self._autoencoder.prediction
+				y_true = self.data
+
+				Lx = loss_beta * tf.reduce_sum(     #对所有x求和
+					tf.sqrt(tf.reduce_sum((y_pred-y_true)**2, 1))   #每个样本x的L2范数
+				)
+				Ly = tf.reduce_sum(tf.sqrt(tf.reduce_sum(
+					(self._target_adv.prediction-self.rerank)**2, 1))
+				)
+				loss = Lx + Ly
+
+				optimizer = tf.train.AdamOptimizer(learning_rate).minimize(   #最小化loss，并更新var_list，返回优化更新后的var_list
+					loss,
+					var_list=tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES,  #tf.get_collection()，从列表中取出所有元素(此处为所有用于反向传播的可训练变量)，构成一个新列表，scope为"autoencoder"
+											   "autoencoder"))
+				return optimizer, loss
+		
+		prediction:返回self._autoencoder.prediction
+		
+		load:对self._autoencoder和self._target调用BasicAE的load方法，restore f(x)和g(x)
+			def load(self, sess, path, prefix="ATN_"):  
+				self._autoencoder.load(sess, path, name=prefix+'basic_ae.ckpt')
+				self._target.load(sess, path+'/BasicCNN')
+		
+		save:对self._autoencoder调用BasicAE的save方法
+		    def save(self, sess, path, prefix="ATN_"):
+				self._autoencoder.save(sess, path, name=prefix+'basic_ae.ckpt')
+
+				
+	basic_ae.py
+		该文件定义一个Class BasicAE，一个MNIST的自编码器
+		用data初始化，且self.data = tf.reshape(data, [-1, 28, 28, 1])   #tf.reshape( tensor, shape, name=None)， shape中的-1是指该维度不用特别指定，自己推算，但是只能有一个-1
+        定义weights,biases.prediction.load,save五个方法
+		weights:返回 _weights
+			_weights为一个dict,key:'W_conv1'~'W_conv9',value:从net_element.weight_variable得到
+					def weight_variable(shape, name):
+					"""
+					对weight进行初始化，使用截断的正态分布
+					"""
+					initializer = tf.truncated_normal(shape, stddev=0.01)   #产生截断的正态分布，如果产生的值与均值差值大于2倍标准差，则丢弃并重新生成
+					return tf.get_variable(initializer=initializer, name=name)    #获取已存在的变量（要求不仅名字，而且初始化方法等各个参数都一样），如果不存在，就新建一个。可以用各种初始化方法，不用明确指定值。
+					
+		biases:返回 _biases
+			_biases为一个dict,key:'b_conv1'~'b_conv9',value:从net_element.bias_variable得到
+					def bias_variable(shape, name):
+					"""
+					对biases进行初始化，初始化为0.1
+					"""
+					initializer = tf.constant(0.1, shape=shape)    #生成给定值为0.1的常量
+					return tf.get_variable(initializer=initializer, name=name)
+		
+		prediction:
+		    使用net_element中的conv2d函数逐层做卷积后接ReLu，最后返回reshape后的h_conv9
+			tf.reshape(h_conv9, [-1, 784])
+			
+			def conv2d(x, W):
+			"""
+			对输入x,卷积核W做卷积，输出feature map
+			"""
+			return tf.nn.conv2d(x, W, strides=[1, 1, 1, 1], padding='SAME')    #tf.nn.conv2d(input, filter, strides, padding, use_cudnn_on_gpu=None, name=None)tf中用于实现卷积的核心函数，input,需要做卷积的输入图像，4维tensor，filter,卷积核，4维张量
+		
+		load：
+			"""恢复模型"""
+			def load(self, sess, path, name='basic_ae.ckpt'):
+				saver = tf.train.Saver(dict(self.weights, **self.biases))  #创建一个saver对象，要保存和恢复的变量为weights和biases
+				saver.restore(sess, path+'/'+name)      #恢复模型，重载模型参数
+		
+		save:
+		    """保存模型"""
+			def save(self, sess, path, name='basic_ae.ckpt'):
+				saver = tf.train.Saver(dict(self.weights, **self.biases))
+				saver.save(sess, path+'/'+name)
+				
+				
+	basic_cnn.py
+		该文件定义了被攻击的模型f(x)，一个Mnist上的CNN
+		"""
+		A cnn for mnist dataset with following structure:
+
+		data[None, 28, 28, 1]
+		max_pooling(relu(conv[5, 5, 1, 32]))
+		max_pooling(relu(conv[5, 5, 32, 64]))
+		drop_out(fc[7*7*64, 1024])
+		softmax(fc[1024, 10])
+		"""	
+		使用data, groundtruth, p_keep初始化
+		
+		def __init__(self, data, groundtruth, p_keep):
+			self.data = tf.reshape(data, [-1, 28, 28, 1])
+			self.groundtruth = groundtruth
+			self.p_keep = p_keep
+		包含weights, biases, prediction, optimization, accuracy, load, save七个方法
+		
+		weights:使用net_element中的weight_variable定义weights的形状并初始化，返回_weights
+			def weights(self):
+				_weights = {
+					'W_conv1': ne.weight_variable([5, 5, 1, 32], name='W_conv1'),
+					'W_conv2': ne.weight_variable([5, 5, 32, 64], name='W_conv2'),
+					'W_fc1': ne.weight_variable([7 * 7 * 64, 1024], name='W_fc1'),
+					'W_fc2': ne.weight_variable([1024, 10], name='W_fc2')
+				}
+				return _weights	
+
+        biases:使用net_element中的bias_variable定义biases的形状并初始化，返回_biases
+			def biases(self):
+				_biases = {
+					'b_conv1': ne.bias_variable([32], name='b_conv1'),
+					'b_conv2': ne.bias_variable([64], name='b_conv2'),
+					'b_fc1': ne.bias_variable([1024], name='b_fc1'),
+					'b_fc2': ne.bias_variable([10], name='b_fc2')
+				}
+				return _biases
+				
+        prediction:定义该网络的结构，正向，返回网络最后的输出y_conv
+			def prediction(self):
+				"""
+				The structure of the network.
+				"""
+				h_conv1 = tf.nn.relu(
+					ne.conv2d(
+						self.data, self.weights['W_conv1']
+					) + self.biases['b_conv1']
+				)
+				h_pool1 = ne.max_pool_2x2(h_conv1)
+
+				h_conv2 = tf.nn.relu(
+					ne.conv2d(
+						h_pool1, self.weights['W_conv2']
+					) + self.biases['b_conv2']
+				)
+				h_pool2 = ne.max_pool_2x2(h_conv2)
+
+				h_pool2_flat = tf.reshape(h_pool2, [-1, 7*7*64])
+				h_fc1 = tf.nn.relu(
+					tf.matmul(
+						h_pool2_flat, self.weights['W_fc1']
+					) + self.biases['b_fc1']
+				)
+
+				h_fc1_drop = tf.nn.dropout(h_fc1, self.p_keep) #p_keep为神经元被选中的概率
+				h_fc2 = tf.matmul(h_fc1_drop, self.weights['W_fc2']) + \
+					self.biases['b_fc2']
+				y_conv = tf.nn.softmax(h_fc2)
+
+				return y_conv
+		
+		accuracy:返回平均accuracy,acc
+			def accuracy(self):
+				correct_prediction = tf.equal(  #tf.equal(A, B)是对比这两个矩阵或者向量的相等的元素，如果是相等的那就返回True，否则返回False，返回的值的矩阵维度和A是一样的
+					tf.argmax(self.groundtruth, 1),   #tf.argmax(A, value),返回A中最大值的索引，value可取0（按列比较）和1（按行比较）
+					tf.argmax(self.prediction, 1)
+				)
+				acc = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))  #tf.cast将比对之后的bool值转换为0，1序列（float32）,并用tf.reduce_mean求平均
+				return acc		
+		
+		load和save分别用于加载已训练好的模型和保存模型
+			def load(self, sess, path, name='basic_cnn.ckpt'):
+				"""
+				Load trained model from .ckpt file.
+				"""
+				saver = tf.train.Saver(dict(self.weights, **self.biases))
+				saver.restore(sess, path+'/'+name)
+
+			def save(self, sess, path, name='basic_cnn.ckpt'):
+				"""
+				Save trained model to .ckpt file.
+				"""
+				saver = tf.train.Saver(dict(self.weights, **self.biases))
+				saver.save(sess, path+'/'+name)		
+				
+			
+	net_element.py
+		该文件包含了一些weight,biases初始化和基本的卷积及最大池化操作
+		包括weight_variable, bias_variable, conv2d, max_pool_2x2四个函数
+		weight_variable:该函数对给定shape的weight进行初始化，使用截断的正态分布，返回weight变量
+			def weight_variable(shape, name):
+				"""
+				"""
+				initializer = tf.truncated_normal(shape, stddev=0.01)
+				return tf.get_variable(initializer=initializer, name=name)
+		
+		bias_variable:该函数对给定shape的bias进行初始化，初始化为0.1，返回biases变量
+			def bias_variable(shape, name):
+				"""
+				"""
+				initializer = tf.constant(0.1, shape=shape)
+				return tf.get_variable(initializer=initializer, name=name)		
+
+		conv2d:对给定x和w进行卷积，strides为1， padding为'SAME'
+			def conv2d(x, W):
+				"""
+				"""
+				return tf.nn.conv2d(x, W, strides=[1, 1, 1, 1], padding='SAME')	
+        
+		max_pool_2x2:对给定x进行最大池化，返回一个tensor,shape为[batch, height, width, channel]
+			def max_pool_2x2(x):
+				"""
+				"""
+				return tf.nn.max_pool(x, ksize=[1, 2, 2, 1],  #tf.nn.max_pool(value, ksize, strides, padding, name=None)，value为需要池化的输入，ksize为池化窗口的大小，一般不在batch和channel两个维度池化，故第一、四分量为1，strides为每个维度上的滑动步长
+									  strides=[1, 2, 2, 1], padding='SAME')		

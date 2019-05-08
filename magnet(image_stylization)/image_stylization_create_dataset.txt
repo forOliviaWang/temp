@@ -1,0 +1,106 @@
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Creates a dataset out of a list of style images.
+
+Each style example in the dataset contains the style image as a JPEG string, a
+unique style label and the pre-computed Gram matrices for all layers of a VGG16
+classifier pre-trained on Imagenet (where max-pooling operations have been
+replaced with average-pooling operations).
+"""
+
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import io
+import os
+
+
+import scipy
+import tensorflow as tf
+
+from magenta.models.image_stylization import image_utils
+from magenta.models.image_stylization import learning
+
+
+flags = tf.app.flags
+flags.DEFINE_string('style_files', None, 'Style image files.')
+flags.DEFINE_string('output_file', None, 'Where to save the dataset.')
+flags.DEFINE_bool('compute_gram_matrices', True, 'Whether to compute Gram'
+                  'matrices or not.')
+FLAGS = flags.FLAGS
+
+
+def _parse_style_files(style_files):
+  """Parse the style_files command-line argument."""
+  style_files = tf.gfile.Glob(style_files)              //tf.gfile.Glob(filename)，查找匹配pattern的文件并以列表的形式返回，filename可以是一个具体的文件名，也可以是包含通配符的正则表达式。
+  if not style_files:
+    raise ValueError('No image files found in {}'.format(style_files))
+  return style_files
+
+
+def _float_feature(value):
+  """Creates a float Feature."""
+  return tf.train.Feature(float_list=tf.train.FloatList(value=value)) //构造每个样本的键值对，tf.train.Features(feature = None)，feature为字典数据，FloatList为实数列表
+
+
+def _int64_feature(value):
+  """Creates an int64 Feature."""
+  return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
+
+
+def _bytes_feature(value):
+  """Creates a byte Feature."""
+  return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+
+
+def main(unused_argv):
+  tf.logging.set_verbosity(tf.logging.INFO)        //为将要被记录的的东西（日志）设置开始入口
+  style_files = _parse_style_files(os.path.expanduser(FLAGS.style_files))  //os.path.expanduser()把path中包含的"~"和"~user"转换成用户目录
+  with tf.python_io.TFRecordWriter(            //写入到TFRecords文件
+      os.path.expanduser(FLAGS.output_file)) as writer:
+    for style_label, style_file in enumerate(style_files):
+      tf.logging.info(                  //记录info级别的日志
+          'Processing style file %s: %s' % (style_label, style_file))
+      feature = {'label': _int64_feature(style_label)} //构建标签特征
+
+      style_image = image_utils.load_np_image(style_file)  //将图像转化为3-D numpy array of shape [image_size, image_size, 3] and dtype float32,with values in [0, 1]
+      buf = io.BytesIO()  //创建一个用来操作二进制数据的BytesIO
+      scipy.misc.imsave(buf, style_image, format='JPEG')  //将数组style_image保存为图像文件存入buf中，JPEG格式
+      buf.seek(0)            //重新设置文件读取指针到开头
+      feature['image_raw'] = _bytes_feature(buf.getvalue()) //构建图像特征
+
+      if FLAGS.compute_gram_matrices:  //如果计算gram矩阵
+        with tf.Graph().as_default(): ////在with的上下文里覆盖默认的图
+          style_end_points = learning.precompute_gram_matrices(       //输入图像（4-D张量）和计算Gram矩阵的最后一层的名字，得到一个dict，内容是层名字和对应的gram矩阵值
+              tf.expand_dims(tf.to_float(style_image), 0),
+              # We use 'pool5' instead of 'fc8' because a) fully-connected
+              # layers are already too deep in the network to be useful for
+              # style and b) they're quite expensive to store.
+              final_endpoint='pool5')
+          for name, matrix in style_end_points.iteritems():
+            feature[name] = _float_feature(matrix.flatten().tolist())  //matrix.flatten()将矩阵拉平，默认参数为‘C’，按行拉平，.tolist变为list,构建一个“层名-gram矩阵值”的特征
+
+      example = tf.train.Example(features=tf.train.Features(feature=feature)) //定义要填入TFRecords文件中的数据格式
+      writer.write(example.SerializeToString())  //序列化为字符串，写入
+  tf.logging.info('Output TFRecord file is saved at %s' % os.path.expanduser(
+      FLAGS.output_file))
+
+
+def console_entry_point():
+  tf.app.run(main)
+
+
+if __name__ == '__main__':
+  console_entry_point()

@@ -1,0 +1,146 @@
+# Copyright 2016 Google Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Trains the N-styles style transfer model."""
+
+from __future__ import absolute_import                  //__future__模块把下一个新版本的特性导入到当前版本，2.7中模块是相对导入的（以"."导入），使用absolute_import后变成绝对导入
+from __future__ import division                         //2.7中除法向下取整，使用division后变成精确除
+from __future__ import print_function                   //2和3最经典的区别，python2中print不需要括号，3中需要括号
+
+import ast                                              //ast模块可以建立抽象语法树.ast提供了访问和修改上述中抽象语法树的功能.可以做一些比如测试,代码生成,静态分析等等
+import os                                               //os模块提供处理文件目录和路径的方法
+
+import tensorflow as tf
+
+from magenta.models.image_stylization import image_utils
+from magenta.models.image_stylization import learning
+from magenta.models.image_stylization import model
+from magenta.models.image_stylization import vgg
+
+slim = tf.contrib.slim              //slim是一个使构建，训练，评估神经网络变得简单的库。它可以消除原生tensorflow里面很多重复的模板性的代码，让代码更紧凑，更具备可读性。另外slim提供了很多计算机视觉方面的著名模型（VGG, AlexNet等）
+
+DEFAULT_CONTENT_WEIGHTS = '{"vgg_16/conv3": 1.0}'
+DEFAULT_STYLE_WEIGHTS = ('{"vgg_16/conv1": 1e-4, "vgg_16/conv2": 1e-4,'
+                         ' "vgg_16/conv3": 1e-4, "vgg_16/conv4": 1e-4}')
+
+flags = tf.app.flags
+flags.DEFINE_float('clip_gradient_norm', 0, 'Clip gradients to this norm')
+flags.DEFINE_float('learning_rate', 1e-3, 'Learning rate')
+flags.DEFINE_integer('batch_size', 16, 'Batch size.')
+flags.DEFINE_integer('image_size', 256, 'Image size.')
+flags.DEFINE_integer('ps_tasks', 0,
+                     'Number of parameter servers. If 0, parameters '
+                     'are handled locally by the worker.')
+flags.DEFINE_integer('num_styles', None, 'Number of styles.')
+flags.DEFINE_integer('save_summaries_secs', 15,
+                     'Frequency at which summaries are saved, in seconds.')
+flags.DEFINE_integer('save_interval_secs', 15,
+                     'Frequency at which the model is saved, in seconds.')
+flags.DEFINE_integer('task', 0,
+                     'Task ID. Used when training with multiple '
+                     'workers to identify each worker.')
+flags.DEFINE_integer('train_steps', 40000, 'Number of training steps.')
+flags.DEFINE_string('content_weights', DEFAULT_CONTENT_WEIGHTS,
+                    'Content weights')
+flags.DEFINE_string('master', '',
+                    'Name of the TensorFlow master to use.')
+flags.DEFINE_string('style_coefficients', None,
+                    'Scales the style weights conditioned on the style image.')
+flags.DEFINE_string('style_dataset_file', None, 'Style dataset file.')
+flags.DEFINE_string('style_weights', DEFAULT_STYLE_WEIGHTS, 'Style weights')
+flags.DEFINE_string('train_dir', None,
+                    'Directory for checkpoints and summaries.')
+FLAGS = flags.FLAGS
+
+
+def main(unused_argv=None):
+  with tf.Graph().as_default():           //在with的上下文里覆盖默认的图
+    # Force all input processing onto CPU in order to reserve the GPU for the
+    # forward inference and back-propagation.
+    device = '/cpu:0' if not FLAGS.ps_tasks else '/job:worker/cpu:0'
+    with tf.device(tf.train.replica_device_setter(FLAGS.ps_tasks,            //tf.device(device_name)函数，其中device_name格式如/cpu:0其中的0表示设备号,可以转换为CPU运算
+                                                  worker_device=device)):
+      inputs, _ = image_utils.imagenet_inputs(FLAGS.batch_size,             //inputs:经过image_utils.imagenet_inputs处理过的imagenet图像,4-D tensor of images of shape [batch_size, image_size, image_size, 3], with values in [0, 1]
+                                              FLAGS.image_size)
+      # Load style images and select one at random (for each graph execution, a
+      # new random selection occurs)
+      _, style_labels, style_gram_matrices = image_utils.style_image_inputs(
+          os.path.expanduser(FLAGS.style_dataset_file),      //把path中包含的"~"和"~user"转换成用户目录，该参数为经过create_style_dataset.py处理后的style图像的目录
+          batch_size=FLAGS.batch_size, image_size=FLAGS.image_size,
+          square_crop=True, shuffle=True)
+
+    with tf.device(tf.train.replica_device_setter(FLAGS.ps_tasks)):
+      # Process style and weight flags
+      num_styles = FLAGS.num_styles
+      if FLAGS.style_coefficients is None:
+        style_coefficients = [1.0 for _ in range(num_styles)]       //如果没有给出每个num_styles对应的style_cofficients的值，则默认为1。（q:style_coefficients参数的意义是？）
+      else:
+        style_coefficients = ast.literal_eval(FLAGS.style_coefficients)    //eval可以实现从元祖，列表，字典型的字符串到元祖，列表，字典的转换，还可以对字符串型的输入直接计算。ast.literal_eval是一个更安全的模式，则会判断需要计算的内容计算后是不是合法的python类型，如果是则进行运算，否则就不进行运算
+      if len(style_coefficients) != num_styles:
+        raise ValueError(
+            'number of style coefficients differs from number of styles')
+      content_weights = ast.literal_eval(FLAGS.content_weights)
+      style_weights = ast.literal_eval(FLAGS.style_weights)
+
+      # Rescale style weights dynamically based on the current style image
+      style_coefficient = tf.gather(                              //tf.gather()从张量中按照索引一次取元素，组成新张量，第一个参数是被取的张量，第二个是索引
+          tf.constant(style_coefficients), style_labels)
+      style_weights = dict([(key, style_coefficient * value)
+                            for key, value in style_weights.iteritems()])
+
+      # Define the model
+      stylized_inputs = model.transform(        //成批输入图像（张量），并将参数传递给正则化层函数ops.conditional_instance_norm，得到经transform网络处理后的张量
+          inputs,
+          normalizer_params={
+              'labels': style_labels,
+              'num_categories': num_styles,
+              'center': True,
+              'scale': True})
+      # Compute losses.
+      total_loss, loss_dict = learning.total_loss(
+          inputs, stylized_inputs, style_gram_matrices, content_weights,
+          style_weights)
+      for key, value in loss_dict.iteritems(): //将字典以列表的方式返回迭代器
+        tf.summary.scalar(key, value)         //输出一个包含单个标量值的Summary协议缓冲区，生成的Summary有一个包含输入Tensor的Tensor.proto
+
+      # Set up training
+      optimizer = tf.train.AdamOptimizer(FLAGS.learning_rate)
+      train_op = slim.learning.create_train_op(                    //create一个train_op,训练必须先定义一个train_op，作用包括：（1）计算损失（2）将梯度运用于参数的更新（3）返回损失值；有时还需要在训练时执行额外的非梯度更新的操作，例如batch_norm
+          total_loss, optimizer, clip_gradient_norm=FLAGS.clip_gradient_norm,  ##clip_gradient_norm大于0时梯度被截止于这个值
+          summarize_gradients=False)   ##返回一个tensor，它计算梯度并返回了loss值
+
+      # Function to restore VGG16 parameters
+      # TODO(iansimon): This is ugly, but assign_from_checkpoint_fn doesn't
+      # exist yet.
+      saver = tf.train.Saver(slim.get_variables('vgg_16'))   //保存模型时，要先创建一个saver对象，slim.get_variables共享变量
+      def init_fn(session):
+        saver.restore(session, vgg.checkpoint_file())   //模型恢复使用.restore(sess,save_path),后一个参数是保存的模型的路径，vgg.checkpoint_file()根据参数返回vgg checkpoint的path
+
+      # Run training
+      slim.learning.train(    ##slim.learning.train根据train_op计算损失、应用梯度step
+          train_op=train_op,
+          logdir=os.path.expanduser(FLAGS.train_dir),  //training logs写入的地方
+          master=FLAGS.master,    //tensorflow master的地址
+          is_chief=FLAGS.task == 0,
+          number_of_steps=FLAGS.train_steps,  //训练过程中需要采取的梯度步骤的最大数量，根据“global_step”测量:如果global_step大于“number_of_steps”，训练将停止。如果这个值为空，训练就会无限期地进行下去
+          init_fn=init_fn,        //调用init_op后可执行的可选调用。（初始化操作。如果保留默认值，则通过调用“tf.global_variables_initializer()”初始化会话。）可调用对象必须接受一个参数，即正在初始化的会话。
+          save_summaries_secs=FLAGS.save_summaries_secs,   //保存summaries的时间间隔
+          save_interval_secs=FLAGS.save_interval_secs)   //用来修改tf.train.saver保存的时间间隔
+
+
+def console_entry_point():
+  tf.app.run(main)
+  
+
+if __name__ == '__main__':
+  console_entry_point()
